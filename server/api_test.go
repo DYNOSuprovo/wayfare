@@ -237,9 +237,13 @@ func TestUnknownQueryParamsAreRejected(t *testing.T) {
 			path:    "/api/corridor?tp=NGNC",
 			wantMsg: `"tp"`,
 		},
+		// "pretty" is deliberately NOT listed here: it is a supported
+		// parameter with its own test (TestPrettyOptInIndents). An earlier
+		// merge left both a test asserting it returns 200 and this one
+		// asserting it returns 400, which cannot both hold.
 		"corridor extra param": {
-			path:    "/api/corridor?to=NGNC&pretty=1",
-			wantMsg: `"pretty"`,
+			path:    "/api/corridor?to=NGNC&verbose=1",
+			wantMsg: `"verbose"`,
 		},
 		"corridor multiple unknown": {
 			path:    "/api/corridor?to=NGNC&tp=NGNC&fmt=json",

@@ -1,6 +1,8 @@
 package asset
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -162,13 +164,41 @@ func TestRegistryCompleteness(t *testing.T) {
 	}
 }
 
+// TestValidateEntryRequiresVerificationDate pins the field that makes a
+// registry entry auditable.
+//
+// An entry without a verification date records that somebody believed the
+// issuer, not that anybody checked it. Issuers rotate accounts, so an
+// undated claim cannot be re-verified or expired — which is why this is a
+// required field rather than a nice-to-have.
 func TestValidateEntryRequiresVerificationDate(t *testing.T) {
 	e := Entry{
 		Code:       "TEST",
 		Issuer:     "GBTEST",
+		Peg:        "TST",
 		Status:     "live",
 		SourceURL:  "https://example.com/.well-known/stellar.toml",
 		HomeDomain: "example.com",
+		// VerificationDate deliberately omitted.
+	}
+
+	err := ValidateEntry(e)
+	if err == nil {
+		t.Fatal("ValidateEntry accepted an entry with no verification date; " +
+			"an undated registration cannot be re-verified or expired")
+	}
+	if !strings.Contains(err.Error(), "verification date") {
+		t.Errorf("error %q does not name the missing field", err)
+	}
+
+	// Control: the same entry with a date must pass, or the test above
+	// would be satisfied by a validator that rejected everything.
+	e.VerificationDate = "2026-08-08"
+	if err := ValidateEntry(e); err != nil {
+		t.Errorf("ValidateEntry rejected a complete entry: %v", err)
+	}
+}
+
 // TestHalfRegisteredEntryFails tests that ValidateEntry fails loudly when
 // any required field is missing from a registration entry, preventing
 // silent misclassification of corridor assets.
@@ -358,12 +388,5 @@ func TestLookupEntry(t *testing.T) {
 
 	if _, ok := LookupEntryByCode("UNKNOWN"); ok {
 		t.Error("LookupEntryByCode(\"UNKNOWN\") must return false")
-	}
-	err := ValidateEntry(e)
-	if err == nil {
-		"expected validation error for missing verification date" // wait, error check below
-	}
-	if err == nil {
-		t.Fatal("expected error for missing verification date, got nil")
 	}
 }

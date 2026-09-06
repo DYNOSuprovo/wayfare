@@ -128,7 +128,7 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusMethodNotAllowed, codeMethodNotAllowed, "only GET is supported")
 		return
 	}
-	if err := checkParams(r, "from", "to", "sizes", "live"); err != nil {
+	if err := checkParams(r, "from", "to", "sizes", "live", "pretty"); err != nil {
 		writeError(w, r, http.StatusBadRequest, codeInvalidQuery, err.Error())
 		return
 	}
@@ -272,6 +272,19 @@ func (s *Server) handleAssets(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, codeInvalidQuery, err.Error())
 		return
 	}
+	// corridorState is the pricing history for a receive asset. The UI needs
+	// this to build a corridor selector that reflects what has actually been
+	// measured rather than what is theoretically possible.
+	//
+	// Omitted entirely for non-destination assets and when no store is
+	// configured, so the wire never carries a fabricated false: "not measured"
+	// and "measured, no history" are different claims.
+	type corridorState struct {
+		HasHistory    bool   `json:"has_history"`
+		LastIntegrity string `json:"last_integrity,omitempty"`
+		LastMeasured  string `json:"last_measured,omitempty"`
+	}
+
 	type entry struct {
 		route.AssetJSON
 		Corridor bool           `json:"can_be_destination"`
@@ -330,12 +343,68 @@ func (s *Server) handleAssets(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, r, http.StatusOK, map[string]any{"assets": out})
 }
 
+// dataAgeJSON is the freshness of one corridor's newest stored record.
+type dataAgeJSON struct {
+	RecordedAt string `json:"recorded_at"`
+	AgeSeconds int64  `json:"age_seconds"`
+	AgeHuman   string `json:"age_human"`
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if err := checkParams(r); err != nil {
 		writeError(w, r, http.StatusBadRequest, codeInvalidQuery, err.Error())
 		return
 	}
-	writeJSON(w, r, http.StatusOK, map[string]string{"status": "ok"})
+
+	out := map[string]any{"status": "ok"}
+
+	// On a history-first deployment the thing at risk is not whether the
+	// process is up, it is how old the data it serves has become. A health
+	// check that only says "ok" would stay green while the measurements
+	// silently aged out.
+	//
+	// A corridor with no history is absent rather than reported as zero, and
+	// the whole block is null when there is nothing to report: an unavailable
+	// age is unknown, never a fabricated "now".
+	out["data"] = s.dataAges(r.Context())
+
+	writeJSON(w, r, http.StatusOK, out)
+}
+
+// dataAges reports the freshness of each corridor's newest record, or nil when
+// nothing is stored.
+func (s *Server) dataAges(ctx context.Context) map[string]dataAgeJSON {
+	if s.Store == nil {
+		return nil
+	}
+	corridors, err := s.Store.Corridors(ctx)
+	if err != nil || len(corridors) == 0 {
+		// A store that cannot be listed is an unknown age, not a zero one.
+		return nil
+	}
+
+	now := time.Now().UTC()
+	ages := make(map[string]dataAgeJSON, len(corridors))
+	for _, c := range corridors {
+		rec, err := s.Store.Latest(ctx, c)
+		if err != nil || rec == nil {
+			continue
+		}
+		recorded := rec.RecordedAt.UTC()
+		age := now.Sub(recorded)
+		if age < 0 {
+			age = 0
+		}
+		ages[c] = dataAgeJSON{
+			RecordedAt: recorded.Format(time.RFC3339),
+			AgeSeconds: int64(age.Seconds()),
+			AgeHuman:   humanAge(age),
+		}
+	}
+	if len(ages) == 0 {
+		return nil
+	}
+	return ages
 }
 
 // helpers --------------------------------------------------------------------
@@ -354,6 +423,9 @@ const (
 	codeUpstreamTimeout     = "upstream_timeout"
 	codeInvalidQuery        = "invalid_query"
 	codeInternalError       = "internal_error"
+	codeInvalidLimit        = "invalid_limit"
+	codeStoreRead           = "store_read_error"
+	codeDivergenceHistory   = "divergence_history_error"
 )
 
 // checkParams rejects any query parameter outside the endpoint's allow-list.

@@ -38,7 +38,9 @@ package sep38
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -352,8 +354,20 @@ func (c *Client) do(req *http.Request, out any) error {
 		}
 		return fmt.Errorf("sep38: %s returned HTTP %d", req.URL.Host, resp.StatusCode)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	dec := json.NewDecoder(resp.Body)
+	if err := dec.Decode(out); err != nil {
 		return fmt.Errorf("sep38: decoding response: %w", err)
+	}
+
+	// Decode stops at the end of the first JSON value, so a body like
+	// `{"price":"5.00"} and then some` would otherwise parse cleanly and
+	// yield a quote. Trailing bytes mean the response is not what it claims
+	// to be, and a partially-understood body is not a safe basis for a price:
+	// this is the fee-denomination lesson again, where arithmetic that
+	// succeeds on a misread input is worse than an error.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("sep38: response carries trailing data after the JSON body; " +
+			"the anchor sent something other than a single quote object")
 	}
 	return nil
 }

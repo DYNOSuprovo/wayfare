@@ -420,6 +420,20 @@ func HomeDomains() map[string]string {
 	return out
 }
 
+// KnownCodes lists the verified token codes, sorted.
+//
+// Sorted because callers render it to a user in error messages naming the
+// valid assets, and an unstable order makes that output differ run to run for
+// no reason. server/api.go and server/trend.go both depend on it.
+func KnownCodes() []string {
+	codes := make([]string, 0, len(known))
+	for c := range known {
+		codes = append(codes, c)
+	}
+	sort.Strings(codes)
+	return codes
+}
+
 // IsKnown reports whether an asset is explicitly registered.
 func IsKnown(a Asset) bool {
 	if a.Kind != KindStellar {
@@ -429,9 +443,40 @@ func IsKnown(a Asset) bool {
 	return ok
 }
 
-// FiatPeg returns the ISO currency code pegged by a registered asset, if any.
-func FiatPeg(a Asset) bool {
-	_, ok := fiatPegs[a.Code+":"+a.Issuer]
+// FiatPeg returns the ISO-4217 currency a registered Stellar token tracks, and
+// whether the token is a known fiat-pegged asset at all.
+//
+// The peg code is the return value that matters: callers score a token against
+// the currency it claims to track, and a bare boolean cannot tell them which
+// currency that is. server/api.go depends on this shape.
+//
+// An unknown token reports false rather than guessing from its code. "NGNC"
+// from an unrecognised issuer is not assumed to track the naira.
+func FiatPeg(a Asset) (string, bool) {
+	if a.Kind != KindStellar || a.Issuer == "" {
+		return "", false
+	}
+	peg, ok := fiatPegs[a.Code+":"+a.Issuer]
+	return peg, ok
+}
+
+// HomeDomain reports the domain publishing an asset's stellar.toml, when the
+// association has been verified.
+//
+// Returns false rather than guessing. A checker with no domain reports that it
+// could not determine something, which is correct; one sent to a guessed
+// domain would report a confident finding about the wrong anchor.
+func HomeDomain(a Asset) (string, bool) {
+	if a.Kind != KindStellar || a.Issuer == "" {
+		return "", false
+	}
+	d, ok := homeDomains[a.Issuer]
+	return d, ok
+}
+
+// IsFiatToken reports whether a is a known fiat-pegged Stellar token.
+func IsFiatToken(a Asset) bool {
+	_, ok := FiatPeg(a)
 	return ok
 }
 

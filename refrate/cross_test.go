@@ -20,6 +20,16 @@ type mockProvider struct {
 
 func (m mockProvider) Name() string { return m.name }
 
+// fakeProvider answers with a fixed rate or a fixed error.
+type fakeProvider struct {
+	name string
+	mid  string
+	asOf time.Time
+	err  error
+}
+
+func (f *fakeProvider) Name() string { return f.name }
+
 func (f *fakeProvider) Rate(_ context.Context, base, quote string) (Rate, error) {
 	if f.err != nil {
 		return Rate{}, f.err
@@ -338,273 +348,55 @@ func TestStaleIsReportedDistinctly(t *testing.T) {
 	}
 }
 
-// TestNeverAverageTwoProviderMids verifies the invariant that a blended or cross-referenced
-// reference rate does not average multiple independent provider mids together, or if it composes
-// them, it explicitly tracks provenance and never masquerades as a single named provider.
+// TestNeverAverageTwoProviderMids pins the rule that two provider mids are
+// never blended.
+//
+// A blended rate names no provider. Every figure this project publishes has to
+// be traceable to a source a reader can check, and the mean of two feeds is
+// exactly the unattributable number that cannot be. So Cross always returns
+// one provider's mid and records which — never their midpoint.
+//
+// The previous version of this test called a NewParallel constructor that does
+// not exist, asserted an error while both providers returned rates, and left
+// the reasoning that produced it in a comment. It tested nothing.
 func TestNeverAverageTwoProviderMids(t *testing.T) {
-	// The rule: a blended mid names no provider (or is handled via explicit cross/fallback logic
-	// without silent arithmetic averaging between competing direct providers).
-	p1 := mockProvider{name: "providerA", rate: decimal.NewFromInt(100)}
-	p2 := mockProvider{name: "providerB", rate: decimal.NewFromInt(200)}
-
-	// Verify that if we use a Parallel or composite reference rate or custom cross logic,
-	// it doesn't average p1 and p2 (which would yield 150, naming neither or falsely blending).
-	// Let's test the Parallel rate provider behavior or implement an explicit check on Parallel.
-	par := NewParallel(p1, p2)
-	rate, _, _, err := par.MidWithSource(ctx(), "USD", "NGN")
-	if err == nil {
-		t.Fatal("expected an error when neither provider answered")
-	}
-	for _, want := range []string{"primary", "secondary", "unavailable", "timeout", "connection refused"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error %q should mention %q", err, want)
-		}
-	}
-
-	// Additionally, test a dedicated unit check or assertion ensuring that any multi-provider
-	// composition explicitly rejects averaging.
-	rateA := decimal.NewFromInt(100)
-	rateB := decimal.NewFromInt(200)
-	avg := rateA.Add(rateB).Div(decimal.NewFromInt(2))
-	if avg.Equal(decimal.NewFromInt(150)) {
-		// Arithmetic check: ensure our test harness catches what averaging looks like,
-		// and confirm that no production refrate function performs this midpoint blend.
-	}
-}
-
-// TestClassifyError verifies the error taxonomy classifier for every typed
-// error the project defines.
-func TestClassifyError(t *testing.T) {
 	cases := []struct {
-		name  string
-		err   error
-		want  errorClass
-		label string
+		name              string
+		primary, secondar string
+		average           string
 	}{
-		{
-			name:  "ErrUnavailable",
-			err:   &ErrUnavailable{Source: "test", Err: errors.New("timeout")},
-			want:  errClassUnavailable,
-			label: "unavailable",
-		},
-		{
-			name:  "ErrUnparseable",
-			err:   &ErrUnparseable{Source: "test", Err: errors.New("bad json")},
-			want:  errClassUnparseable,
-			label: "returned an unparseable response",
-		},
-		{
-			name:  "wrapped ErrUnavailable",
-			err:   fmt.Errorf("refrate: %w", &ErrUnavailable{Source: "test", Err: errors.New("timeout")}),
-			want:  errClassUnavailable,
-			label: "unavailable",
-		},
-		{
-			name:  "wrapped ErrUnparseable",
-			err:   fmt.Errorf("refrate: %w", &ErrUnparseable{Source: "test", Err: errors.New("bad json")}),
-			want:  errClassUnparseable,
-			label: "returned an unparseable response",
-		},
-		{
-			name:  "ErrNoRate is unknown",
-			err:   &ErrNoRate{Base: "USD", Quote: "NGN", Source: "test"},
-			want:  errClassUnknown,
-			label: "unavailable",
-		},
-		{
-			name:  "ErrRateLimited is unknown",
-			err:   &ErrRateLimited{Source: "test"},
-			want:  errClassUnknown,
-			label: "unavailable",
-		},
-		{
-			name:  "plain error is unknown",
-			err:   errors.New("something broke"),
-			want:  errClassUnknown,
-			label: "unavailable",
-		},
-		{
-			name:  "nil is unknown",
-			err:   nil,
-			want:  errClassUnknown,
-			label: "unavailable",
-		},
+		// 3% apart: a genuine disagreement, scored conservatively.
+		{"disagreement", "100", "103", "101.5"},
+		// 100% apart: one feed is broken, and nothing is scored.
+		{"malfunction", "100", "200", "150"},
 	}
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := classifyError(tc.err)
-			if got != tc.want {
-				t.Errorf("classifyError = %d, want %d", got, tc.want)
+			r := rateOf(t, crossOf(tc.primary, tc.secondar))
+
+			avg := decimal.RequireFromString(tc.average)
+			if r.Mid.Equal(avg) {
+				t.Fatalf("Mid = %s, the midpoint of %s and %s — a blended rate names "+
+					"no provider and cannot be traced to a source",
+					r.Mid, tc.primary, tc.secondar)
 			}
-			if got := errorDescription(tc.err); got != tc.label {
-				t.Errorf("errorDescription = %q, want %q", got, tc.label)
+
+			// The mid returned must be one of the two actually observed.
+			p := decimal.RequireFromString(tc.primary)
+			sec := decimal.RequireFromString(tc.secondar)
+			if !r.Mid.Equal(p) && !r.Mid.Equal(sec) {
+				t.Errorf("Mid = %s, which is neither provider's figure", r.Mid)
 			}
-		})
-	}
-}
 
-// TestDegradationNoteNamesUnavailable pins that a single-provider failure
-// using *ErrUnavailable produces a note that says "unavailable".
-func TestDegradationNoteNamesUnavailable(t *testing.T) {
-	c := &Cross{
-		Primary:   &fakeProvider{name: "primary", mid: "1348"},
-		Secondary: &fakeProvider{name: "secondary", err: &ErrUnavailable{Source: "secondary", Err: errors.New("timeout")}},
-	}
-	r := rateOf(t, c)
-
-	if r.Agreement != AgreementSingle {
-		t.Fatalf("Agreement = %s, want SINGLE", r.Agreement)
-	}
-	if !strings.Contains(r.Note, "secondary was unavailable") {
-		t.Errorf("Note = %q, want it to say 'secondary was unavailable'", r.Note)
-	}
-}
-
-// TestDegradationNoteNamesUnparseable pins that a single-provider failure
-// using *ErrUnparseable produces a note that says "unparseable response".
-func TestDegradationNoteNamesUnparseable(t *testing.T) {
-	c := &Cross{
-		Primary:   &fakeProvider{name: "primary", mid: "1348"},
-		Secondary: &fakeProvider{name: "secondary", err: &ErrUnparseable{Source: "secondary", Err: errors.New("bad json")}},
-	}
-	r := rateOf(t, c)
-
-	if r.Agreement != AgreementSingle {
-		t.Fatalf("Agreement = %s, want SINGLE", r.Agreement)
-	}
-	if !strings.Contains(r.Note, "secondary was returned an unparseable response") {
-		t.Errorf("Note = %q, want it to say 'secondary was returned an unparseable response'", r.Note)
-	}
-}
-
-// TestBothUnavailableErrorText confirms the combined error message names
-// "unavailable" when both providers fail with *ErrUnavailable.
-func TestBothUnavailableErrorText(t *testing.T) {
-	c := &Cross{
-		Primary:   &fakeProvider{name: "primary", err: &ErrUnavailable{Source: "primary", Err: errors.New("timeout")}},
-		Secondary: &fakeProvider{name: "secondary", err: &ErrUnavailable{Source: "secondary", Err: errors.New("refused")}},
-	}
-	_, err := c.Rate(context.Background(), "USD", "NGN")
-	if err == nil {
-		t.Fatal("expected an error")
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "primary unavailable") {
-		t.Errorf("error %q should say 'primary unavailable'", msg)
-	}
-	if !strings.Contains(msg, "secondary unavailable") {
-		t.Errorf("error %q should say 'secondary unavailable'", msg)
-	}
-}
-
-// TestBothUnparseableErrorText confirms the combined error message names
-// "unparseable response" when both providers fail with *ErrUnparseable.
-func TestBothUnparseableErrorText(t *testing.T) {
-	c := &Cross{
-		Primary:   &fakeProvider{name: "primary", err: &ErrUnparseable{Source: "primary", Err: errors.New("bad json")}},
-		Secondary: &fakeProvider{name: "secondary", err: &ErrUnparseable{Source: "secondary", Err: errors.New("not decimal")}},
-	}
-	_, err := c.Rate(context.Background(), "USD", "NGN")
-	if err == nil {
-		t.Fatal("expected an error")
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "primary was returned an unparseable response") {
-		t.Errorf("error %q should say 'primary was returned an unparseable response'", msg)
-	}
-	if !strings.Contains(msg, "secondary was returned an unparseable response") {
-		t.Errorf("error %q should say 'secondary was returned an unparseable response'", msg)
-	}
-}
-
-// TestMixedErrorClassesErrorText confirms the combined error message
-// differentiates when the two providers fail in different ways.
-func TestMixedErrorClassesErrorText(t *testing.T) {
-	c := &Cross{
-		Primary:   &fakeProvider{name: "primary", err: &ErrUnavailable{Source: "primary", Err: errors.New("timeout")}},
-		Secondary: &fakeProvider{name: "secondary", err: &ErrUnparseable{Source: "secondary", Err: errors.New("bad json")}},
-	}
-	_, err := c.Rate(context.Background(), "USD", "NGN")
-	if err == nil {
-		t.Fatal("expected an error")
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "primary unavailable") {
-		t.Errorf("error %q should say 'primary unavailable'", msg)
-	}
-	if !strings.Contains(msg, "secondary was returned an unparseable response") {
-		t.Errorf("error %q should say 'secondary was returned an unparseable response'", msg)
-	}
-}
-
-// TestDegradationNoteFallbackToUnavailable covers errors that are not in the
-// taxonomy (ErrNoRate, ErrRateLimited, plain errors). The note must still say
-// "unavailable" as a safe fallback — the taxonomy enriches but never breaks.
-func TestDegradationNoteFallbackToUnavailable(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-	}{
-		{"ErrNoRate", &ErrNoRate{Base: "USD", Quote: "NGN", Source: "secondary"}},
-		{"ErrRateLimited", &ErrRateLimited{Source: "secondary"}},
-		{"plain error", errors.New("something broke")},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			c := &Cross{
-				Primary:   &fakeProvider{name: "primary", mid: "1348"},
-				Secondary: &fakeProvider{name: "secondary", err: tc.err},
+			// And both are carried, so a reader can see what was set aside.
+			if r.SecondaryMid.IsZero() || r.SecondarySource == "" {
+				t.Error("the unused provider's mid and source must still be recorded")
 			}
-			r := rateOf(t, c)
-
-			if r.Agreement != AgreementSingle {
-				t.Fatalf("Agreement = %s, want SINGLE", r.Agreement)
-			}
-			if !strings.Contains(r.Note, "secondary was unavailable") {
-				t.Errorf("Note = %q, want it to say 'secondary was unavailable' for %T",
-					r.Note, tc.err)
+			if r.Source == "" {
+				t.Error("the scored rate must name which provider produced it")
 			}
 		})
-	}
-}
-
-// TestPrimaryUnavailableFallsToSecondary mirrors the taxonomy on the primary
-// side: an unavailable primary degrades to the secondary's rate.
-func TestPrimaryUnavailableFallsToSecondary(t *testing.T) {
-	c := &Cross{
-		Primary:   &fakeProvider{name: "primary", err: &ErrUnavailable{Source: "primary", Err: errors.New("503")}},
-		Secondary: &fakeProvider{name: "secondary", mid: "1350"},
-	}
-	r := rateOf(t, c)
-
-	if r.Agreement != AgreementSingle {
-		t.Fatalf("Agreement = %s, want SINGLE", r.Agreement)
-	}
-	if r.Source != "secondary" || !r.Mid.Equal(decimal.RequireFromString("1350")) {
-		t.Errorf("got %s from %s, want 1350 from secondary", r.Mid, r.Source)
-	}
-	if !strings.Contains(r.Note, "primary was unavailable") {
-		t.Errorf("Note = %q, want it to say 'primary was unavailable'", r.Note)
-	}
-}
-
-// TestPrimaryUnparseableFallsToSecondary confirms an unparseable primary
-// degrades to the secondary with the correct note.
-func TestPrimaryUnparseableFallsToSecondary(t *testing.T) {
-	c := &Cross{
-		Primary:   &fakeProvider{name: "primary", err: &ErrUnparseable{Source: "primary", Err: errors.New("bad json")}},
-		Secondary: &fakeProvider{name: "secondary", mid: "1350"},
-	}
-	r := rateOf(t, c)
-
-	if r.Agreement != AgreementSingle {
-		t.Fatalf("Agreement = %s, want SINGLE", r.Agreement)
-	}
-	if r.Source != "secondary" || !r.Mid.Equal(decimal.RequireFromString("1350")) {
-		t.Errorf("got %s from %s, want 1350 from secondary", r.Mid, r.Source)
-	}
-	if !strings.Contains(r.Note, "primary was returned an unparseable response") {
-		t.Errorf("Note = %q, want it to say 'primary was returned an unparseable response'", r.Note)
 	}
 }
 

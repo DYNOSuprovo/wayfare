@@ -170,10 +170,17 @@ func TestErrorResponseShape(t *testing.T) {
 		t.Fatalf("decoding error body: %v", err)
 	}
 
-	// Exactly one key: "error". A measurement-looking body on an error path
-	// would let an SRE dashboard accidentally parse it as data.
-	if len(body) != 1 {
-		t.Errorf("error body has %d keys, want exactly 1: %v", len(body), body)
+	// Exactly two keys: "error" and "code". A measurement-looking body on an
+	// error path would let an SRE dashboard accidentally parse it as data, so
+	// the shape is pinned rather than merely checked for the fields it needs.
+	//
+	// "code" is the machine-readable discriminator: clients switch on it
+	// rather than matching the human-readable message, which is free to change.
+	if len(body) != 2 {
+		t.Errorf("error body has %d keys, want exactly 2 (error, code): %v", len(body), body)
+	}
+	if _, ok := body["code"]; !ok {
+		t.Error("error body must carry the machine-readable code key")
 	}
 	raw, ok := body["error"]
 	if !ok {
